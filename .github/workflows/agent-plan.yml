@@ -15,12 +15,12 @@ jobs:
     permissions:
       contents: read
       issues: write
-    uses: atulg4/agentic-sdlc/.github/workflows/reusable-plan.yml@90863a6c325a35f696de6304fb5329555e22c813
+    uses: atulg4/agentic-sdlc/.github/workflows/reusable-plan.yml@2213ee45859eaea46a177fd3cdbafe812901b205
     with:
       issue_number: ${{ inputs.issue_number }}
       trigger_actor: ${{ github.actor }}
       config_path: agentic-sdlc.toml
-      platform_ref: 90863a6c325a35f696de6304fb5329555e22c813
+      platform_ref: 2213ee45859eaea46a177fd3cdbafe812901b205
       platform_repository: atulg4/agentic-sdlc
     secrets:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
