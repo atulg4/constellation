@@ -7,7 +7,7 @@ default_branch = "main"
 
 [agents]
 planner = "codex"
-implementer = "codex"
+implementer = "claude"
 reviewer = "codex"
 
 [automation]
