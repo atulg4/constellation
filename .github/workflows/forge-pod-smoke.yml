@@ -1,0 +1,60 @@
+name: Forge pod smoke
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+      - '.github/tests/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: forge-pod-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: constellation-runners
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Verify toolchain and nested sandbox without provider credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          for tool in git gh jq python3 node npm bwrap socat; do command -v "$tool"; done
+          python3 --version
+          node --version
+          npm --version
+          gh --version
+          bwrap --unshare-user --uid 0 --gid 0 --ro-bind / / /bin/true
+          bwrap --unshare-user --unshare-pid --unshare-net --ro-bind / / --proc /proc --dev /dev /bin/true
+          python3 -m pip install PyYAML==6.0.3
+          python3 -m unittest discover -s .github/tests -p "test_*.py"
+          # Includes test_runner_routing.py and the immutable compatibility check.
+          printf '%s\n' "$RUNNER_NAME" > runner-handoff.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: forge-pod-handoff-${{ github.run_id }}
+          path: runner-handoff.txt
+          if-no-files-found: error
+          retention-days: 1
+  handoff:
+    needs: probe
+    runs-on: constellation-runners
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: forge-pod-handoff-${{ github.run_id }}
+      - name: Verify handoff to a fresh ephemeral runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s runner-handoff.txt
+          test "$(cat runner-handoff.txt)" != "$RUNNER_NAME"
+          echo 'Artifact handoff between distinct ephemeral runners passed.'

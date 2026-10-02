@@ -22,8 +22,9 @@ jobs:
       contents: write
       issues: read
       pull-requests: read
-    uses: atulg4/agentic-sdlc/.github/workflows/reusable-implement.yml@2213ee45859eaea46a177fd3cdbafe812901b205
+    uses: ./.github/workflows/forge-compat-implement.yml
     with:
+      runs_on: '"constellation-runners"'
       issue_number: ${{ inputs.issue_number }}
       trigger_actor: ${{ github.actor }}
       config_path: agentic-sdlc.toml
