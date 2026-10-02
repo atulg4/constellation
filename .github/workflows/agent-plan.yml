@@ -15,8 +15,9 @@ jobs:
     permissions:
       contents: read
       issues: write
-    uses: atulg4/agentic-sdlc/.github/workflows/reusable-plan.yml@2213ee45859eaea46a177fd3cdbafe812901b205
+    uses: ./.github/workflows/forge-compat-plan.yml
     with:
+      runs_on: '"constellation-runners"'
       issue_number: ${{ inputs.issue_number }}
       trigger_actor: ${{ github.actor }}
       config_path: agentic-sdlc.toml
