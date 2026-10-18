@@ -1,0 +1,27 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "FORGE_SESSION_PATH=\"$PATH\" PATH=/usr/bin:/bin /opt/homebrew/bin/python3 -I -c 'import hashlib,os,sys,types;p,h=sys.argv[1:3];b=open(p,\"rb\").read();d=hashlib.sha256(b).hexdigest();d==h or (sys.stderr.write(\"Forge hook: \"+p+\" is not the copy onboard installed (sha256 \"+d+\"); blocking. Restore it or re-run sdlcctl onboard --force.\\n\"),sys.exit(2));os.environ[\"PATH\"]=os.environ.pop(\"FORGE_SESSION_PATH\",\"\");sys.argv=[p];m=types.ModuleType(\"__main__\");m.__file__=p;sys.modules[\"__main__\"]=m;exec(compile(b,p,\"exec\"),m.__dict__)' \"${CLAUDE_PROJECT_DIR}/.claude/hooks/forge_session_start.py\" 8a5e13109d10a9bee8608a8794e2ff9c516d775f9ad9466bca700ba555fbb4b9"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "FORGE_SESSION_PATH=\"$PATH\" PATH=/usr/bin:/bin /opt/homebrew/bin/python3 -I -c 'import hashlib,os,sys,types;p,h=sys.argv[1:3];b=open(p,\"rb\").read();d=hashlib.sha256(b).hexdigest();d==h or (sys.stderr.write(\"Forge hook: \"+p+\" is not the copy onboard installed (sha256 \"+d+\"); blocking. Restore it or re-run sdlcctl onboard --force.\\n\"),sys.exit(2));os.environ[\"PATH\"]=os.environ.pop(\"FORGE_SESSION_PATH\",\"\");sys.argv=[p];m=types.ModuleType(\"__main__\");m.__file__=p;sys.modules[\"__main__\"]=m;exec(compile(b,p,\"exec\"),m.__dict__)' \"${CLAUDE_PROJECT_DIR}/.claude/hooks/forge_commit_guard.py\" dceede0fda86cdedb87716e8fd4e9da243fee2cc1c68be38b892de3ede032b78 || exit 2",
+            "timeout": 300,
+            "onFailure": "block"
+          }
+        ]
+      }
+    ]
+  }
+}

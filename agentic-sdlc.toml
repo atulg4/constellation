@@ -6,20 +6,39 @@ provider = "github"
 default_branch = "main"
 
 [agents]
-planner = "codex"
+planner = "claude"
 implementer = "claude"
 reviewer = "codex"
+# Where implementation runs: "actions" (agent-implement.yml / agent-auto-implement.yml) or
+# "cloud-routine" (docs/forge/cloud-implementer.md). `sdlcctl doctor` reads this, never infers it.
+implementation_mode = "cloud-routine"
 
 [automation]
 default_mode = "plan"
-ready_label = "agent-ready"
+ready_label = "claude-ready"
 human_review_label = "human-review-required"
 implementation_label = "implementation-approved"
+lease_ttl_minutes = 240
+# The Publisher App's bot login, `<app-slug>[bot]`: the only GitHub App whose lease markers
+# count (besides github-actions[bot]). Empty: none does. Set it with `sdlcctl onboard --force
+# --publisher-bot-login <app-slug>[bot]`.
+publisher_bot_login = ""
+# Which git, gh and hook interpreter Forge runs: "strict" (only ones root alone can replace) or
+# "local" (a developer's own machine: the first on PATH, owned by root or the user). GitHub Actions
+# and Claude Code cloud sessions are always strict. Change with `sdlcctl onboard --force
+# --trust-mode`.
+trust_mode = "local"
+# true: the owner acknowledged that the self-hosted runners the Forge jobs use are ephemeral or
+# contained (`--ephemeral-runners`); they run model-produced patches and pull-request code.
+ephemeral_runners = false
 
 [policy]
 human_merge_required = true
+# Approvals the "Protect main" ruleset requires before a merge (`--required-approvals`). 0 means
+# GitHub does not enforce the human-merge boundary: whoever can merge, merges.
+required_approvals = 0
 max_changed_files = 20
-max_diff_lines = 2000
+max_diff_lines = 2500
 max_patch_bytes = 5000000
 forbidden_paths = [
   ".github/**",
@@ -27,6 +46,8 @@ forbidden_paths = [
   ".gitlab-ci.yml",
   ".gitlab/**",
   "agentic-sdlc.toml",
+  ".forge/**",
+  ".claude/**",
   "CODEOWNERS",
   "**/CODEOWNERS",
   "AGENTS.md",
@@ -39,16 +60,91 @@ forbidden_paths = [
   "**/*.pem",
   "*.key",
   "**/*.key",
+  "*.db",
+  "**/*.db",
+  "*.sqlite",
+  "**/*.sqlite",
+  "*.sqlite3",
+  "**/*.sqlite3",
+  "*.png",
+  "**/*.png",
+  "*.jpg",
+  "**/*.jpg",
+  "*.jpeg",
+  "**/*.jpeg",
+  "*.gif",
+  "**/*.gif",
+  "*.webp",
+  "**/*.webp",
+  "*.bmp",
+  "**/*.bmp",
+  "*.ico",
+  "**/*.ico",
+  "*.tif",
+  "**/*.tif",
+  "*.tiff",
+  "**/*.tiff",
+  "*.heic",
+  "**/*.heic",
+  "*.avif",
+  "**/*.avif",
+  "*.mp4",
+  "**/*.mp4",
+  "*.mov",
+  "**/*.mov",
+  "*.avi",
+  "**/*.avi",
+  "*.mkv",
+  "**/*.mkv",
+  "*.webm",
+  "**/*.webm",
+  "*.m4v",
+  "**/*.m4v",
+  "*.wmv",
+  "**/*.wmv",
+  "*.flv",
+  "**/*.flv",
+  "*.mp3",
+  "**/*.mp3",
+  "*.wav",
+  "**/*.wav",
+  "*.flac",
+  "**/*.flac",
+  "*.ogg",
+  "**/*.ogg",
+  "*.m4a",
+  "**/*.m4a",
+  "*.aac",
+  "**/*.aac",
+  "*.opus",
+  "**/*.opus",
+  "*.wma",
+  "**/*.wma",
+  "*.aiff",
+  "**/*.aiff",
 ]
-protected_paths = ["src/auth/**", "migrations/**", "deployment/**"]
+protected_paths = [
+  "crates/constellation-core/src/crypto.rs",
+  "crates/constellation-core/src/identity.rs",
+]
 low_risk_paths = ["docs/**", "**/*.md"]
 forbidden_task_patterns = [
-  '\bdeploy\b.{0,40}\bprod',
-  '\b(?:production|broker)\b.{0,40}\b(?:credential|password|token)',
-  '\bdisable\b.{0,40}\b(?:auth|test|safety)',
+  "\\bdeploy\\b.{0,40}\\bprod",
+  "\\b(?:print|return|expose|retrieve)\\b.{0,40}\\b(?:credential|password|secret|token)",
+  "\\bdisable\\b.{0,40}\\b(?:auth|test|safety)",
 ]
 
 [commands]
+# Rendered verbatim into ci.yml's `test` job, which doctor requires to match exactly: change a
+# command here and re-run `sdlcctl onboard --force`. One line each.
+setup = "cargo fetch --locked"
+quality = "cargo fmt --all --check && cargo clippy --all-targets --locked -- -D warnings"
+test = "cargo test --workspace --locked"
+
+[ci]
+# The interpreter ci.yml's pinned actions/setup-python installs.
+python_version = "3.12"
 
 [verification]
-gates = []
+gates = ["setup", "quality", "test"]
+timeout_seconds = { setup = 900, quality = 300, test = 900 }
