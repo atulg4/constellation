@@ -1,0 +1,29 @@
+[package]
+name = "constellation-core"
+version = "0.1.0"
+description = "Constellation Mission 001 core runtime: signed encrypted envelopes, bounded custody store, deterministic store-carry-forward simulator"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+# Signatures: Ed25519 (RFC 8032) via dalek, verify_strict for malleability resistance.
+ed25519-dalek = { version = "3.0", features = ["zeroize"] }
+# Payload encryption: HPKE (RFC 9180) base mode, DHKEM(X25519, HKDF-SHA256) + ChaCha20-Poly1305.
+hpke = { version = "0.14", default-features = false, features = ["x25519", "chacha", "alloc"] }
+# Canonical wire encoding: CBOR with integer map keys (RFC 8949 deterministic subset).
+minicbor = { version = "2.3", features = ["derive", "std"] }
+rand_chacha = "0.10"
+rand_core = "0.10"
+sha2 = "0.11"
+thiserror = "2"
+zeroize = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+hex = "0.4"
+
+
+[lints]
+workspace = true
