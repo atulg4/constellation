@@ -1,15 +1,31 @@
-//! Bounded in-memory custody store.
+//! Bounded custody stores.
 //!
-//! Holds only signed envelopes and ciphertext. Enforces object size, object
-//! count, per-peer count, and total byte quotas; expires by TTL. Mission 001
-//! policy is reject-on-full: no priority eviction yet. Persistence across
-//! process restart is deferred (see the ADR's non-goals).
+//! A store holds only signed envelopes and ciphertext. It enforces object
+//! size, object count, per-peer count, and total byte quotas; expires by TTL;
+//! and remembers every id it has seen for duplicate suppression. Mission 001
+//! policy is reject-on-full: no priority eviction yet.
+//!
+//! [`MemoryStore`] lives for the process. [`FileStore`] keeps the same
+//! behaviour and additionally persists every accepted object under a
+//! directory so a carrier survives a restart between accepting custody and
+//! meeting the recipient. Nothing a store writes is ever plaintext.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 
+use minicbor::{Decode, Encode};
+
+use crate::crypto::sha256;
 use crate::envelope::{Envelope, ObjectId};
 use crate::identity::DeviceId;
-use crate::{Timestamp, MAX_CIPHERTEXT_BYTES};
+use crate::{Timestamp, MAX_CIPHERTEXT_BYTES, MAX_FRAME_BYTES};
+
+/// Most seen ids a [`FileStore`] reads back at open. Ids beyond this bound
+/// are dropped at load, which can only cause a duplicate to be re-examined
+/// by the full validation pipeline, never a plaintext or custody error.
+pub const MAX_SEEN_IDS: usize = 1 << 16;
 
 /// Quotas for one node's store.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,6 +60,10 @@ pub enum StoreError {
     /// A count or byte quota would be exceeded.
     #[error("store quota exceeded")]
     QuotaExceeded,
+    /// The backing storage could not be written. Carries no path or OS
+    /// detail so it is safe to surface in events and acks.
+    #[error("store unavailable")]
+    Io,
 }
 
 /// An object under custody, with its transport-local state.
@@ -61,6 +81,35 @@ pub struct StoredObject {
     pub from: Option<DeviceId>,
     /// When it entered this store.
     pub received_at: Timestamp,
+}
+
+/// What a node needs from its custody store.
+///
+/// Every method is infallible except [`insert`](Self::insert): a backend
+/// that cannot record a removal or a seen id keeps the in-memory truth and
+/// at worst re-offers or re-examines an object after a restart, which the
+/// validation pipeline already handles.
+pub trait ObjectStore: core::fmt::Debug {
+    /// Whether this id was ever accepted, delivered, or created here.
+    fn seen(&self, id: &ObjectId) -> bool;
+    /// Remembers `id` for duplicate suppression without storing bytes.
+    fn mark_seen(&mut self, id: ObjectId);
+    /// Inserts under quota. Marks the id seen on success.
+    fn insert(&mut self, object: StoredObject) -> Result<(), StoreError>;
+    /// Removes and returns an object; it stays remembered as seen.
+    fn remove(&mut self, id: &ObjectId) -> Option<StoredObject>;
+    /// Looks up an object.
+    fn get(&self, id: &ObjectId) -> Option<&StoredObject>;
+    /// All held objects in id order.
+    fn iter(&self) -> Box<dyn Iterator<Item = &StoredObject> + '_>;
+    /// Number of held objects.
+    fn len(&self) -> usize;
+    /// Whether nothing is held.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Drops every object with `expires_at <= now`; returns their ids.
+    fn expire(&mut self, now: Timestamp) -> Vec<ObjectId>;
 }
 
 /// In-memory store with quotas and duplicate memory.
@@ -82,19 +131,18 @@ impl MemoryStore {
             total_bytes: 0,
         }
     }
+}
 
-    /// Whether this id was ever accepted, delivered, or created here.
-    pub fn seen(&self, id: &ObjectId) -> bool {
+impl ObjectStore for MemoryStore {
+    fn seen(&self, id: &ObjectId) -> bool {
         self.seen.contains(id)
     }
 
-    /// Remembers `id` for duplicate suppression without storing bytes.
-    pub fn mark_seen(&mut self, id: ObjectId) {
+    fn mark_seen(&mut self, id: ObjectId) {
         self.seen.insert(id);
     }
 
-    /// Inserts under quota. Marks the id seen on success.
-    pub fn insert(&mut self, object: StoredObject) -> Result<(), StoreError> {
+    fn insert(&mut self, object: StoredObject) -> Result<(), StoreError> {
         let size = object.ciphertext.len();
         if size > self.policy.max_object_bytes {
             return Err(StoreError::TooLarge);
@@ -120,35 +168,25 @@ impl MemoryStore {
         Ok(())
     }
 
-    /// Removes and returns an object; it stays remembered as seen.
-    pub fn remove(&mut self, id: &ObjectId) -> Option<StoredObject> {
+    fn remove(&mut self, id: &ObjectId) -> Option<StoredObject> {
         let removed = self.objects.remove(id)?;
         self.total_bytes -= removed.ciphertext.len();
         Some(removed)
     }
 
-    /// Looks up an object.
-    pub fn get(&self, id: &ObjectId) -> Option<&StoredObject> {
+    fn get(&self, id: &ObjectId) -> Option<&StoredObject> {
         self.objects.get(id)
     }
 
-    /// All held objects in id order.
-    pub fn iter(&self) -> impl Iterator<Item = &StoredObject> {
-        self.objects.values()
+    fn iter(&self) -> Box<dyn Iterator<Item = &StoredObject> + '_> {
+        Box::new(self.objects.values())
     }
 
-    /// Number of held objects.
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.objects.len()
     }
 
-    /// Whether nothing is held.
-    pub fn is_empty(&self) -> bool {
-        self.objects.is_empty()
-    }
-
-    /// Drops every object with `expires_at <= now`; returns their ids.
-    pub fn expire(&mut self, now: Timestamp) -> Vec<ObjectId> {
+    fn expire(&mut self, now: Timestamp) -> Vec<ObjectId> {
         let expired: Vec<ObjectId> = self
             .objects
             .values()
@@ -162,10 +200,263 @@ impl MemoryStore {
     }
 }
 
+/// On-disk form of one held object: exactly what [`StoredObject`] holds,
+/// in canonical CBOR. Never contains plaintext or any key material.
+#[derive(Encode, Decode)]
+#[cbor(map)]
+struct Record {
+    #[n(0)]
+    envelope: Envelope,
+    #[cbor(n(1), with = "minicbor::bytes")]
+    ciphertext: Vec<u8>,
+    #[n(2)]
+    hop_count: u8,
+    #[n(3)]
+    from: Option<DeviceId>,
+    #[n(4)]
+    received_at: Timestamp,
+}
+
+const OBJECTS_DIR: &str = "objects";
+const SEEN_FILE: &str = "seen.bin";
+const OBJECT_EXT: &str = "cbor";
+const TEMP_EXT: &str = "tmp";
+
+/// A [`MemoryStore`] mirrored to a directory.
+///
+/// Layout under the root: `objects/<object id as hex>.cbor` holds one
+/// [`Record`] per held object and `seen.bin` is the concatenation of every
+/// seen 32-byte id. Each write goes to a `.tmp` sibling, is synced, and is
+/// renamed into place, so a crash leaves either the old or the new file.
+/// Objects are only inserted after the node's validation pipeline accepted
+/// them, and every entry is re-checked at open: bounded size, well-formed
+/// CBOR, id matching its file name, ciphertext matching the signed
+/// commitment, and the current quotas. Entries that fail are skipped and
+/// counted, never trusted and never a panic.
+#[derive(Debug)]
+pub struct FileStore {
+    root: PathBuf,
+    memory: MemoryStore,
+    rejected_at_load: usize,
+}
+
+impl FileStore {
+    /// Opens or creates the store at `root` and loads what it holds.
+    pub fn open(root: impl AsRef<Path>, policy: StorePolicy) -> io::Result<Self> {
+        let root = root.as_ref().to_path_buf();
+        fs::create_dir_all(root.join(OBJECTS_DIR))?;
+        let mut store = Self {
+            root,
+            memory: MemoryStore::new(policy),
+            rejected_at_load: 0,
+        };
+        store.load_seen()?;
+        store.load_objects()?;
+        Ok(store)
+    }
+
+    /// The directory this store persists under.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Entries skipped at open because they were corrupt, oversized,
+    /// inconsistent with their envelope, or over quota.
+    pub fn rejected_at_load(&self) -> usize {
+        self.rejected_at_load
+    }
+
+    fn objects_dir(&self) -> PathBuf {
+        self.root.join(OBJECTS_DIR)
+    }
+
+    fn object_path(&self, id: &ObjectId) -> PathBuf {
+        self.objects_dir()
+            .join(format!("{}.{OBJECT_EXT}", hex(id.as_bytes())))
+    }
+
+    fn load_seen(&mut self) -> io::Result<()> {
+        let path = self.root.join(SEEN_FILE);
+        remove_stale_temp(&path);
+        let file = match File::open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let limit = MAX_SEEN_IDS * ObjectId::LEN;
+        let mut bytes = Vec::new();
+        file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > limit {
+            self.rejected_at_load += 1;
+            bytes.truncate(limit);
+        }
+        let mut chunks = bytes.chunks_exact(ObjectId::LEN);
+        for chunk in &mut chunks {
+            let mut id = [0u8; ObjectId::LEN];
+            id.copy_from_slice(chunk);
+            self.memory.mark_seen(ObjectId(id));
+        }
+        if !chunks.remainder().is_empty() {
+            self.rejected_at_load += 1;
+        }
+        Ok(())
+    }
+
+    fn load_objects(&mut self) -> io::Result<()> {
+        let mut paths: Vec<PathBuf> = Vec::new();
+        for entry in fs::read_dir(self.objects_dir())? {
+            let path = entry?.path();
+            match path.extension().and_then(|e| e.to_str()) {
+                Some(OBJECT_EXT) => paths.push(path),
+                Some(TEMP_EXT) => {
+                    let _ = fs::remove_file(&path);
+                }
+                _ => {}
+            }
+        }
+        paths.sort();
+        for path in paths {
+            let accepted =
+                read_record(&path).is_some_and(|object| self.memory.insert(object).is_ok());
+            if !accepted {
+                self.rejected_at_load += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_seen(&self) -> io::Result<()> {
+        let mut bytes = Vec::with_capacity(self.memory.seen.len() * ObjectId::LEN);
+        for id in self.memory.seen.iter().take(MAX_SEEN_IDS) {
+            bytes.extend_from_slice(id.as_bytes());
+        }
+        write_atomic(&self.root.join(SEEN_FILE), &bytes)
+    }
+
+    fn write_object(&self, object: &StoredObject) -> io::Result<()> {
+        let record = Record {
+            envelope: object.envelope.clone(),
+            ciphertext: object.ciphertext.clone(),
+            hop_count: object.hop_count,
+            from: object.from,
+            received_at: object.received_at,
+        };
+        let bytes = minicbor::to_vec(&record).expect("encoding into Vec cannot fail");
+        write_atomic(&self.object_path(&object.object_id), &bytes)
+    }
+}
+
+impl ObjectStore for FileStore {
+    fn seen(&self, id: &ObjectId) -> bool {
+        self.memory.seen(id)
+    }
+
+    fn mark_seen(&mut self, id: ObjectId) {
+        if self.memory.seen(&id) {
+            return;
+        }
+        self.memory.mark_seen(id);
+        let _ = self.write_seen();
+    }
+
+    fn insert(&mut self, object: StoredObject) -> Result<(), StoreError> {
+        let id = object.object_id;
+        self.memory.insert(object)?;
+        let written = self
+            .write_object(self.memory.get(&id).expect("just inserted"))
+            .and_then(|()| self.write_seen());
+        if written.is_err() {
+            let _ = fs::remove_file(self.object_path(&id));
+            self.memory.remove(&id);
+            return Err(StoreError::Io);
+        }
+        Ok(())
+    }
+
+    fn remove(&mut self, id: &ObjectId) -> Option<StoredObject> {
+        let removed = self.memory.remove(id)?;
+        let _ = fs::remove_file(self.object_path(id));
+        Some(removed)
+    }
+
+    fn get(&self, id: &ObjectId) -> Option<&StoredObject> {
+        self.memory.get(id)
+    }
+
+    fn iter(&self) -> Box<dyn Iterator<Item = &StoredObject> + '_> {
+        self.memory.iter()
+    }
+
+    fn len(&self) -> usize {
+        self.memory.len()
+    }
+
+    fn expire(&mut self, now: Timestamp) -> Vec<ObjectId> {
+        let expired = self.memory.expire(now);
+        for id in &expired {
+            let _ = fs::remove_file(self.object_path(id));
+        }
+        expired
+    }
+}
+
+/// Reads and re-validates one object file. `None` means skip it.
+fn read_record(path: &Path) -> Option<StoredObject> {
+    let len = fs::metadata(path).ok()?.len();
+    if len > MAX_FRAME_BYTES as u64 {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    let record: Record = minicbor::decode(&bytes).ok()?;
+    let body = &record.envelope.body;
+    if record.ciphertext.len() > MAX_CIPHERTEXT_BYTES
+        || record.ciphertext.len() != body.payload_size as usize
+        || sha256(&[&record.ciphertext]) != body.payload_hash
+    {
+        return None;
+    }
+    let object_id = record.envelope.object_id();
+    let stem = path.file_stem().and_then(|s| s.to_str())?;
+    if stem != hex(object_id.as_bytes()) {
+        return None;
+    }
+    Some(StoredObject {
+        object_id,
+        envelope: record.envelope,
+        ciphertext: record.ciphertext,
+        hop_count: record.hop_count,
+        from: record.from,
+        received_at: record.received_at,
+    })
+}
+
+/// Writes `bytes` to a `.tmp` sibling, syncs it, and renames it over `path`.
+fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let tmp = path.with_extension(TEMP_EXT);
+    let result = (|| {
+        let mut file = File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn remove_stale_temp(path: &Path) {
+    let _ = fs::remove_file(path.with_extension(TEMP_EXT));
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::{Hash, SUITE_HPKE_X25519_HKDF_SHA256_CHACHA20POLY1305};
+    use crate::crypto::SUITE_HPKE_X25519_HKDF_SHA256_CHACHA20POLY1305;
     use crate::envelope::{Audience, Encryption, EnvelopeBody, Routing};
     use crate::identity::{DeviceIdentity, EncryptionKey, UserIdentity};
     use rand_chacha::rand_core::SeedableRng;
@@ -186,7 +477,7 @@ mod tests {
                 device: device.id(),
             },
             payload_size: size as u32,
-            payload_hash: Hash([tag; 32]),
+            payload_hash: sha256(&[&vec![tag; size]]),
             encryption: Encryption {
                 suite: SUITE_HPKE_X25519_HKDF_SHA256_CHACHA20POLY1305,
                 encapsulated_key: EncryptionKey([0; 32]),
@@ -247,5 +538,108 @@ mod tests {
         assert_eq!(store.len(), 1);
         assert_eq!(store.expire(500).len(), 1);
         assert!(store.is_empty());
+    }
+
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default();
+            let path = std::env::temp_dir().join(format!(
+                "constellation-store-{tag}-{}-{nanos}",
+                std::process::id()
+            ));
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn object_path(dir: &std::path::Path, id: &ObjectId) -> std::path::PathBuf {
+        dir.join("objects")
+            .join(format!("{}.cbor", hex::encode(id.as_bytes())))
+    }
+
+    #[test]
+    fn file_store_round_trips_objects_and_seen_across_reopen() {
+        let dir = TempDir::new("roundtrip");
+        let peer = DeviceId([9; 32]);
+        let held = object(1, 40, Some(peer), 1_000);
+        let delivered = object(2, 5, None, 1_000).object_id;
+        let gone = object(3, 5, None, 1_000);
+        {
+            let mut store = FileStore::open(dir.path(), StorePolicy::default()).expect("open");
+            store.insert(held.clone()).expect("insert");
+            store.mark_seen(delivered);
+            store.insert(gone.clone()).expect("insert");
+            assert!(store.remove(&gone.object_id).is_some());
+            assert!(object_path(dir.path(), &held.object_id).is_file());
+            assert!(!object_path(dir.path(), &gone.object_id).exists());
+        }
+        let store = FileStore::open(dir.path(), StorePolicy::default()).expect("reopen");
+        assert_eq!(store.rejected_at_load(), 0);
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.get(&held.object_id), Some(&held));
+        assert!(store.seen(&held.object_id));
+        assert!(store.seen(&delivered));
+        assert!(store.seen(&gone.object_id), "removed ids stay remembered");
+        assert!(store.get(&gone.object_id).is_none());
+        assert!(!store.seen(&object(4, 5, None, 1_000).object_id));
+    }
+
+    #[test]
+    fn file_store_skips_corrupt_entries_at_load() {
+        let dir = TempDir::new("corrupt");
+        let good = object(1, 40, None, 1_000);
+        let truncated = object(2, 40, None, 1_000);
+        let tampered = object(3, 40, None, 1_000);
+        {
+            let mut store = FileStore::open(dir.path(), StorePolicy::default()).expect("open");
+            store.insert(good.clone()).expect("insert");
+            store.insert(truncated.clone()).expect("insert");
+            store.insert(tampered.clone()).expect("insert");
+        }
+        let objects = dir.path().join("objects");
+        // A write that never completed.
+        let path = object_path(dir.path(), &truncated.object_id);
+        let bytes = std::fs::read(&path).expect("read");
+        std::fs::write(&path, &bytes[..bytes.len() / 2]).expect("truncate");
+        // A ciphertext byte flipped on disk: the signed commitment no longer holds.
+        let path = object_path(dir.path(), &tampered.object_id);
+        let mut bytes = std::fs::read(&path).expect("read");
+        let pos = bytes
+            .windows(40)
+            .position(|w| w == tampered.ciphertext.as_slice())
+            .expect("ciphertext is stored verbatim");
+        bytes[pos] ^= 0x01;
+        std::fs::write(&path, &bytes).expect("tamper");
+        // Not CBOR at all, and larger than any frame could be.
+        std::fs::write(objects.join("junk.cbor"), b"not an object").expect("junk");
+        std::fs::write(objects.join("huge.cbor"), vec![0u8; MAX_FRAME_BYTES + 1]).expect("huge");
+        // A torn seen-set write leaves a partial trailing id.
+        let seen = dir.path().join("seen.bin");
+        let mut bytes = std::fs::read(&seen).expect("read seen");
+        bytes.extend_from_slice(&[1, 2, 3]);
+        std::fs::write(&seen, &bytes).expect("tear seen");
+
+        let store = FileStore::open(dir.path(), StorePolicy::default()).expect("reopen");
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.get(&good.object_id), Some(&good));
+        assert_eq!(store.rejected_at_load(), 5);
+        // Complete seen entries survive the torn tail.
+        assert!(store.seen(&good.object_id));
+        assert!(store.seen(&truncated.object_id));
+        assert!(store.seen(&tampered.object_id));
     }
 }

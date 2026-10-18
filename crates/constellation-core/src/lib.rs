@@ -14,7 +14,7 @@
 //! - [`identity`]: user and device keys, signed device authorization, contact trust.
 //! - [`envelope`]: canonical signed envelope, object ids, wire frames.
 //! - [`crypto`]: HPKE payload sealing and SHA-256 helpers (no custom primitives).
-//! - [`store`]: bounded in-memory custody store with quotas and TTL expiry.
+//! - [`store`]: bounded custody stores (in-memory and on-disk) with quotas and TTL expiry.
 //! - [`node`]: the validation pipeline, custody policy, and privacy-safe events.
 //! - [`transport`]: the adapter contract that platform transports will implement.
 //! - [`sim`]: deterministic in-process network for the A/B/C scenarios.
@@ -30,6 +30,9 @@ macro_rules! fixed_bytes {
         pub struct $name(pub [u8; $len]);
 
         impl $name {
+            /// Length in bytes.
+            pub const LEN: usize = $len;
+
             /// Borrows the raw bytes.
             pub fn as_bytes(&self) -> &[u8; $len] {
                 &self.0

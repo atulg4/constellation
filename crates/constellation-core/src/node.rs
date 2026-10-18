@@ -8,6 +8,8 @@
 //! ciphertext hash → duplicate → decrypt or store.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io;
+use std::path::Path;
 
 use minicbor::{Decode, Encode};
 use rand_core::CryptoRng;
@@ -18,7 +20,7 @@ use crate::envelope::{
 };
 use crate::identity::{ContactBook, DeviceId, DeviceIdentity, DeviceRecord, EncryptionKey, UserId};
 pub use crate::store::StorePolicy;
-use crate::store::{MemoryStore, StoreError, StoredObject};
+use crate::store::{FileStore, MemoryStore, ObjectStore, StoreError, StoredObject};
 use crate::{domain, Timestamp, MAX_CIPHERTEXT_BYTES, MAX_PLAINTEXT_BYTES, PROTOCOL_VERSION};
 
 /// Local policy for one node.
@@ -112,6 +114,9 @@ pub enum RejectReason {
     /// Custody offered by someone other than the creator: one custody hop only.
     #[n(15)]
     CustodyNotFromCreator,
+    /// The node's store could not persist the object.
+    #[n(16)]
+    StoreUnavailable,
 }
 
 /// Lifecycle states reported in events.
@@ -209,7 +214,7 @@ pub struct Node {
     device: DeviceIdentity,
     contacts: ContactBook,
     policy: Policy,
-    store: MemoryStore,
+    store: Box<dyn ObjectStore>,
     inbox: Vec<Delivered>,
     events: Vec<Event>,
     salt: [u8; 32],
@@ -219,15 +224,40 @@ pub struct Node {
 }
 
 impl Node {
-    /// Creates a node for `device` trusting `contacts` under `policy`.
+    /// Creates a node for `device` trusting `contacts` under `policy`,
+    /// with custody held in memory for the life of the process.
     pub fn new(device: DeviceIdentity, contacts: ContactBook, policy: Policy) -> Self {
-        let salt = device.local_salt();
         let store = MemoryStore::new(policy.store.clone());
+        Self::with_store(device, contacts, policy, store)
+    }
+
+    /// Like [`Node::new`], but custody and duplicate memory persist under
+    /// `dir`, so the node resumes carrying after a restart. Opening the same
+    /// directory with the same device identity restores what was held.
+    pub fn persistent(
+        device: DeviceIdentity,
+        contacts: ContactBook,
+        policy: Policy,
+        dir: impl AsRef<Path>,
+    ) -> io::Result<Self> {
+        let store = FileStore::open(dir, policy.store.clone())?;
+        Ok(Self::with_store(device, contacts, policy, store))
+    }
+
+    /// Creates a node over an already-built store. The store's own quotas
+    /// apply; `policy.store` is not consulted again.
+    pub fn with_store(
+        device: DeviceIdentity,
+        contacts: ContactBook,
+        policy: Policy,
+        store: impl ObjectStore + 'static,
+    ) -> Self {
+        let salt = device.local_salt();
         Self {
             device,
             contacts,
             policy,
-            store,
+            store: Box::new(store),
             inbox: Vec::new(),
             events: Vec::new(),
             salt,
@@ -578,6 +608,7 @@ impl Node {
                 Some(match e {
                     StoreError::TooLarge => RejectReason::PayloadTooLarge,
                     StoreError::QuotaExceeded => RejectReason::QuotaExceeded,
+                    StoreError::Io => RejectReason::StoreUnavailable,
                 })
             })?;
         Ok(Accepted::Custody)
