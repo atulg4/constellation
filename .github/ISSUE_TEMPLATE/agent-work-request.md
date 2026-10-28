@@ -2,7 +2,7 @@
 name: Agent work request
 about: A complete request for the Agentic SDLC pipeline
 title: ""
-labels: agent-ready, human-review-required
+labels: ["claude-ready", "human-review-required"]
 assignees: ""
 ---
 
