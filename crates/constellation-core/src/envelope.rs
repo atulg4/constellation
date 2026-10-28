@@ -211,6 +211,10 @@ pub enum FrameError {
     /// The bytes are not a valid frame.
     #[error("malformed frame: {0}")]
     Malformed(String),
+    /// The bytes decode, but are not the canonical encoding of what they decode to
+    /// (trailing data, non-minimal integers, reordered or duplicate keys).
+    #[error("frame is not canonically encoded")]
+    NonCanonical,
 }
 
 impl Frame {
@@ -219,12 +223,19 @@ impl Frame {
         minicbor::to_vec(self).expect("encoding into Vec cannot fail")
     }
 
-    /// Bounded decode: rejects oversized input before parsing.
+    /// Bounded, canonical-only decode: rejects oversized input before parsing,
+    /// and rejects any input that is not byte-for-byte the canonical encoding of
+    /// the value it decodes to, so one byte string can never mean two envelopes.
     pub fn decode(bytes: &[u8]) -> Result<Self, FrameError> {
         if bytes.len() > MAX_FRAME_BYTES {
             return Err(FrameError::TooLarge(bytes.len()));
         }
-        minicbor::decode(bytes).map_err(|e| FrameError::Malformed(e.to_string()))
+        let frame: Self =
+            minicbor::decode(bytes).map_err(|e| FrameError::Malformed(e.to_string()))?;
+        if frame.encode() != bytes {
+            return Err(FrameError::NonCanonical);
+        }
+        Ok(frame)
     }
 }
 
@@ -371,6 +382,34 @@ mod tests {
         assert!(matches!(
             Frame::decode(b"\xff"),
             Err(FrameError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn non_canonical_frame_encodings_are_rejected() {
+        let (_, envelope) = fixture();
+        let bytes = Frame::Object {
+            envelope,
+            ciphertext: vec![7; 21],
+            hop_count: 1,
+        }
+        .encode();
+        // The frame ends with map key 2 then hop_count 1 (0x02 0x01).
+        assert_eq!(&bytes[bytes.len() - 2..], &[0x02, 0x01]);
+
+        let mut trailing = bytes.clone();
+        trailing.push(0x00);
+        assert!(matches!(
+            Frame::decode(&trailing),
+            Err(FrameError::NonCanonical)
+        ));
+
+        // Same value, non-minimal integer head: 0x18 0x01 instead of 0x01.
+        let mut long_int = bytes[..bytes.len() - 1].to_vec();
+        long_int.extend_from_slice(&[0x18, 0x01]);
+        assert!(matches!(
+            Frame::decode(&long_int),
+            Err(FrameError::NonCanonical)
         ));
     }
 }

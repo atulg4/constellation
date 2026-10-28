@@ -5,9 +5,9 @@
 //! Every rejection path in `missions/001-core-runtime.md` is exercised here.
 
 use constellation_core::crypto;
-use constellation_core::envelope::{Audience, Envelope, Frame, ObjectId};
+use constellation_core::envelope::{AckOutcome, Audience, Envelope, Frame, ObjectId};
 use constellation_core::identity::{ContactBook, DeviceIdentity, DeviceRecord, UserIdentity};
-use constellation_core::node::{Node, ObjectState, Policy, RejectReason, StorePolicy};
+use constellation_core::node::{Node, ObjectState, Policy, RejectReason, StorePolicy, SubmitError};
 use constellation_core::sim::Simulator;
 use constellation_core::{Timestamp, MAX_PLAINTEXT_BYTES};
 use rand_chacha::rand_core::SeedableRng;
@@ -182,7 +182,7 @@ fn recipient_rejects_corrupted_ciphertext() {
 
     let mut corrupted = stored.ciphertext.clone();
     corrupted[3] ^= 0x01;
-    sim.connect(&b.record.device, &c.record.device);
+    sim.link(&b.record.device, &c.record.device);
     sim.inject(
         &b.record.device,
         &c.record.device,
@@ -193,15 +193,13 @@ fn recipient_rejects_corrupted_ciphertext() {
         },
     );
     sim.run_until_idle();
-    // The genuine copy arrived on connect; the corrupted copy adds nothing.
     assert_eq!(
         states(&sim, &c),
-        vec![
-            ObjectState::Delivered,
-            ObjectState::Rejected(RejectReason::PayloadHashMismatch)
-        ]
+        vec![ObjectState::Rejected(RejectReason::PayloadHashMismatch)]
     );
-    assert_eq!(sim.node(&c.record.device).inbox().len(), 1);
+    assert!(sim.node(&c.record.device).inbox().is_empty());
+    // B still holds the genuine copy and delivers it afterwards.
+    assert_eq!(sim.node(&b.record.device).custody().len(), 1);
 }
 
 #[test]
@@ -343,7 +341,7 @@ fn hop_limit_blocks_second_custody_hop() {
 
     // A frame claiming an over-limit hop count is rejected outright.
     let stored = sim.node(&b.record.device).custody()[0].clone();
-    sim.connect(&b.record.device, &c.record.device);
+    sim.link(&b.record.device, &c.record.device);
     sim.inject(
         &b.record.device,
         &c.record.device,
@@ -354,13 +352,9 @@ fn hop_limit_blocks_second_custody_hop() {
         },
     );
     sim.run_until_idle();
-    // The genuine copy arrived at hop 2 on connect; hop 3 is refused.
     assert_eq!(
         states(&sim, &c),
-        vec![
-            ObjectState::Delivered,
-            ObjectState::Rejected(RejectReason::HopLimitExceeded)
-        ]
+        vec![ObjectState::Rejected(RejectReason::HopLimitExceeded)]
     );
 }
 
@@ -487,4 +481,228 @@ fn object_id_is_stable_across_nodes_and_derived_from_ciphertext() {
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+// ---- Review hardening (Codex review of PR #3) ----
+
+#[test]
+fn tampered_recipient_record_is_refused_at_submit() {
+    let (mut sim, a, _b, c) = cast();
+    let attacker = party(9);
+    let mut forged = c.record.clone();
+    forged.encryption_key = attacker.record.encryption_key;
+    assert_eq!(
+        sim.submit(&a.record.device, &forged, SECRET, ONE_HOUR),
+        Err(SubmitError::InvalidRecipient)
+    );
+    let mut reassigned = c.record.clone();
+    reassigned.user = attacker.record.user;
+    assert_eq!(
+        sim.submit(&a.record.device, &reassigned, SECRET, ONE_HOUR),
+        Err(SubmitError::InvalidRecipient)
+    );
+    assert!(sim.node(&a.record.device).custody().is_empty());
+}
+
+#[test]
+fn carrier_cannot_relaunch_custody_as_a_first_hop() {
+    let (mut sim, a, b, c) = cast();
+    let x = party(5);
+    sim.add_node(Node::new(
+        x.device.clone(),
+        contacts(&[&a, &b, &c, &x]),
+        carrier_policy(),
+    ));
+    sim.submit(&a.record.device, &c.record, SECRET, ONE_HOUR)
+        .expect("submit");
+    sim.connect(&a.record.device, &b.record.device);
+    sim.run_until_idle();
+    let stored = sim.node(&b.record.device).custody()[0].clone();
+    // B resets the hop count and offers A's object to X as if it were the creator.
+    sim.link(&b.record.device, &x.record.device);
+    sim.inject(
+        &b.record.device,
+        &x.record.device,
+        Frame::Object {
+            envelope: stored.envelope,
+            ciphertext: stored.ciphertext,
+            hop_count: 1,
+        },
+    );
+    sim.run_until_idle();
+    assert_eq!(
+        states(&sim, &x),
+        vec![ObjectState::Rejected(RejectReason::CustodyNotFromCreator)]
+    );
+    assert!(sim.node(&x.record.device).custody().is_empty());
+}
+
+#[test]
+fn forged_acknowledgements_do_not_destroy_custody() {
+    let (mut sim, a, b, c) = cast();
+    let x = party(5);
+    sim.add_node(Node::new(
+        x.device.clone(),
+        contacts(&[&a, &b, &c, &x]),
+        endpoint_policy(),
+    ));
+    let id = sim
+        .submit(&a.record.device, &c.record, SECRET, ONE_HOUR)
+        .expect("submit");
+    sim.connect(&a.record.device, &b.record.device);
+    sim.run_until_idle();
+    // X learned the id and claims delivery and custody to B; B never offered X anything.
+    sim.link(&x.record.device, &b.record.device);
+    for outcome in [
+        AckOutcome::Delivered,
+        AckOutcome::Duplicate,
+        AckOutcome::CustodyAccepted,
+    ] {
+        sim.inject(
+            &x.record.device,
+            &b.record.device,
+            Frame::Ack {
+                object_id: id,
+                outcome,
+            },
+        );
+    }
+    sim.run_until_idle();
+    assert_eq!(sim.node(&b.record.device).custody().len(), 1);
+    assert_eq!(states(&sim, &b), vec![ObjectState::CustodyAccepted]);
+}
+
+#[test]
+fn delivery_ack_must_come_from_the_audience_device() {
+    let (mut sim, a, b, c) = cast();
+    let id = sim
+        .submit(&a.record.device, &c.record, SECRET, ONE_HOUR)
+        .expect("submit");
+    // A offered custody to B, so B may say CustodyAccepted, but never Delivered.
+    sim.link(&a.record.device, &b.record.device);
+    sim.offer(&a.record.device, &b.record.device);
+    sim.inject(
+        &b.record.device,
+        &a.record.device,
+        Frame::Ack {
+            object_id: id,
+            outcome: AckOutcome::Delivered,
+        },
+    );
+    // Drop the genuine Object frame A queued: deliver only the forged ack.
+    sim.drop_frames_to(&b.record.device);
+    sim.run_until_idle();
+    assert_eq!(sim.node(&a.record.device).custody().len(), 1);
+    let _ = c;
+}
+
+#[test]
+fn submit_purges_expired_objects_before_enforcing_quota() {
+    let a = party(1);
+    let c = party(3);
+    let book = contacts(&[&a, &c]);
+    let tiny = Policy {
+        store: StorePolicy {
+            max_objects: 1,
+            ..StorePolicy::default()
+        },
+        ..endpoint_policy()
+    };
+    let mut sim = Simulator::new(T0, 1);
+    sim.add_node(Node::new(a.device.clone(), book, tiny));
+    sim.submit(&a.record.device, &c.record, b"first", 1_000)
+        .expect("submit");
+    sim.advance(1_000);
+    assert!(sim
+        .submit(&a.record.device, &c.record, b"second", 1_000)
+        .is_ok());
+    assert_eq!(sim.node(&a.record.device).custody().len(), 1);
+}
+
+#[test]
+fn inbox_is_bounded_and_can_be_drained() {
+    let a = party(1);
+    let c = party(3);
+    let book = contacts(&[&a, &c]);
+    let mut sim = Simulator::new(T0, 1);
+    sim.add_node(Node::new(a.device.clone(), book.clone(), endpoint_policy()));
+    sim.add_node(Node::new(
+        c.device.clone(),
+        book,
+        Policy {
+            max_inbox: 1,
+            ..endpoint_policy()
+        },
+    ));
+    sim.submit(&a.record.device, &c.record, b"one", ONE_HOUR)
+        .expect("submit");
+    sim.submit(&a.record.device, &c.record, b"two", ONE_HOUR)
+        .expect("submit");
+    sim.connect(&a.record.device, &c.record.device);
+    sim.run_until_idle();
+    assert_eq!(sim.node(&c.record.device).inbox().len(), 1);
+    assert!(states(&sim, &c).contains(&ObjectState::Rejected(RejectReason::QuotaExceeded)));
+    // The refused object stays with A; draining the inbox makes room.
+    let drained = sim.node_mut(&c.record.device).take_inbox();
+    assert_eq!(drained.len(), 1);
+    assert!(sim.node(&c.record.device).inbox().is_empty());
+    sim.disconnect(&a.record.device, &c.record.device);
+    sim.connect(&a.record.device, &c.record.device);
+    sim.run_until_idle();
+    assert_eq!(sim.node(&c.record.device).inbox().len(), 1);
+    assert!(sim.node(&a.record.device).custody().is_empty());
+}
+
+#[test]
+fn custody_is_offered_only_to_trusted_carriers() {
+    let a = party(1);
+    let c = party(3);
+    let stranger = party(7);
+    let mut sim = Simulator::new(T0, 1);
+    // A trusts C but not the stranger, who advertises that it carries for anyone.
+    sim.add_node(Node::new(
+        a.device.clone(),
+        contacts(&[&a, &c]),
+        endpoint_policy(),
+    ));
+    sim.add_node(Node::new(
+        stranger.device.clone(),
+        contacts(&[&a, &c, &stranger]),
+        carrier_policy(),
+    ));
+    sim.submit(&a.record.device, &c.record, SECRET, ONE_HOUR)
+        .expect("submit");
+    sim.connect(&a.record.device, &stranger.record.device);
+    sim.run_until_idle();
+    assert!(states(&sim, &stranger).is_empty());
+    assert_eq!(sim.node(&a.record.device).custody().len(), 1);
+}
+
+#[test]
+fn known_object_is_suppressed_before_any_verification() {
+    let (mut sim, a, b, c) = cast();
+    sim.submit(&a.record.device, &c.record, SECRET, ONE_HOUR)
+        .expect("submit");
+    sim.connect(&a.record.device, &b.record.device);
+    sim.run_until_idle();
+    let stored = sim.node(&b.record.device).custody()[0].clone();
+    sim.connect(&b.record.device, &c.record.device);
+    sim.run_until_idle();
+    // A replay with garbage ciphertext is recognised by id and dropped as a duplicate
+    // without hashing or decrypting anything.
+    sim.inject(
+        &b.record.device,
+        &c.record.device,
+        Frame::Object {
+            envelope: stored.envelope,
+            ciphertext: vec![0xff; 8],
+            hop_count: 2,
+        },
+    );
+    sim.run_until_idle();
+    assert_eq!(
+        states(&sim, &c),
+        vec![ObjectState::Delivered, ObjectState::Duplicate]
+    );
+    assert_eq!(sim.node(&c.record.device).inbox().len(), 1);
 }

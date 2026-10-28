@@ -57,8 +57,12 @@ revisited before any wire compatibility exists.
 6. **Custody bounds.** Hop count is transport-local state outside the
    signed envelope; the creator declares `max_hops` and nodes clamp it to
    local policy (default 2, counting the final delivery). Only the creator
-   offers custody, and only to peers that advertise it, so there is exactly
-   one custody hop. Carrier defaults: 65 552 bytes per object, 8 MiB total,
+   offers custody, only to peers that advertise it and whose user is in its
+   contact book, and a carrier accepts custody only from the signed creator at
+   hop 1, so there is exactly one custody hop. Acknowledgements release a held
+   object only from a peer it was offered to; delivery acks only from the
+   audience device. Frames that are not canonically encoded are dropped, and
+   known envelope ids are dropped before any verification work. Carrier defaults: 65 552 bytes per object, 8 MiB total,
    256 objects, 32 per handing-over peer; reject-on-full, TTL expiry, no
    priority eviction. Duplicate suppression remembers every accepted,
    delivered or created id for the life of the process.

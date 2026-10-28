@@ -28,9 +28,14 @@ the mission's acceptance criteria.
 
 ## Validation order
 
+Frames are decoded canonically: bytes that are not exactly the canonical
+re-encoding of what they decode to are dropped before validation.
+
 An incoming object is checked in this order and the first failure is
 reported in the ack and the receiver's event log:
 
+0. duplicate: an envelope id already held or delivered is dropped before any
+   signature, hash or decryption work
 1. protocol version
 2. ciphertext bound
 3. encryption suite
@@ -39,10 +44,22 @@ reported in the ack and the receiver's event log:
 6. envelope signature
 7. TTL (`now >= expires_at` is expired) and clock skew
 8. hop limit (clamped to local policy)
-9. audience: addressed to this device and this user, else custody policy
+9. audience: addressed to this device and this user; otherwise custody
+   policy, and custody is accepted only from the signed creator at hop 1
 10. ciphertext hash and size against the signed commitment
-11. duplicate
-12. decrypt (audience) or store under quota (carrier)
+11. decrypt into a bounded inbox (audience) or store under quota (carrier)
+
+## Sender-side rules
+
+- `submit` refuses a recipient record whose user-signed authorization does
+  not verify or does not match its user, device and encryption key.
+- `submit` expires stale objects before enforcing quotas.
+- Custody is offered only to peers whose user is in the contact book.
+- An acknowledgement releases a held object only if it comes from a peer the
+  object was offered to. `Delivered` and `Duplicate` must come from the
+  audience device; `CustodyAccepted` only applies to objects created here.
+- Applications drain decrypted objects with `Node::take_inbox`; when the
+  inbox is full, new deliveries are refused and stay with the sender.
 
 ## Scenarios covered by `tests/three_device.rs`
 
@@ -62,4 +79,6 @@ reported in the ack and the receiver's event log:
 - `Transport` has no implementation besides the simulator; the first
   physical smoke test (Multipeer / Nearby / LAN) is a separate change.
 - Receipts are unsigned acks between peers in contact, not the signed
-  custody receipts ADR-0008 describes for later missions.
+  custody receipts ADR-0008 describes for later missions. Peer identity in
+  the simulator is taken as reported; a real transport must authenticate the
+  peer's device key before its `PeerInfo` is trusted.

@@ -107,7 +107,22 @@ impl Simulator {
         self.offer(b, a);
     }
 
-    fn offer(&mut self, from: &DeviceId, to: &DeviceId) {
+    /// Creates a link without either side offering anything, for tests that
+    /// inject frames over a live link.
+    pub fn link(&mut self, a: &DeviceId, b: &DeviceId) {
+        self.links.insert(link(a, b));
+    }
+
+    /// Drops every frame in flight towards `to`, as if the radio lost them.
+    pub fn drop_frames_to(&mut self, to: &DeviceId) {
+        let before = self.queue.len();
+        self.queue.retain(|p| p.to != *to);
+        self.dropped += before - self.queue.len();
+    }
+
+    /// Has `from` run its contact logic towards `to` (what `connect` does in
+    /// each direction), queuing whatever it offers.
+    pub fn offer(&mut self, from: &DeviceId, to: &DeviceId) {
         let Some(peer) = self.peers.get(to).cloned() else {
             return;
         };

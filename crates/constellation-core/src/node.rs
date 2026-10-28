@@ -7,6 +7,8 @@
 //! signature → TTL and clock skew → hop limit → audience/custody policy →
 //! ciphertext hash → duplicate → decrypt or store.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use minicbor::{Decode, Encode};
 use rand_core::CryptoRng;
 
@@ -30,6 +32,9 @@ pub struct Policy {
     pub max_clock_skew_ms: u64,
     /// Store quotas.
     pub store: StorePolicy,
+    /// Decrypted objects held in the inbox before new deliveries are refused.
+    /// Applications drain it with [`Node::take_inbox`].
+    pub max_inbox: usize,
 }
 
 impl Default for Policy {
@@ -39,6 +44,7 @@ impl Default for Policy {
             max_hops: 2,
             max_clock_skew_ms: 5 * 60_000,
             store: StorePolicy::default(),
+            max_inbox: 256,
         }
     }
 }
@@ -103,6 +109,9 @@ pub enum RejectReason {
     /// Authenticated decryption failed.
     #[n(14)]
     DecryptionFailed,
+    /// Custody offered by someone other than the creator: one custody hop only.
+    #[n(15)]
+    CustodyNotFromCreator,
 }
 
 /// Lifecycle states reported in events.
@@ -177,6 +186,10 @@ pub enum SubmitError {
     /// TTL must be positive.
     #[error("ttl must be positive")]
     ZeroTtl,
+    /// The recipient record's authorization does not verify or does not match
+    /// its user, device and encryption key.
+    #[error("recipient record is not authorized by its user")]
+    InvalidRecipient,
     /// Encryption failed.
     #[error(transparent)]
     Crypto(#[from] CryptoError),
@@ -200,6 +213,9 @@ pub struct Node {
     inbox: Vec<Delivered>,
     events: Vec<Event>,
     salt: [u8; 32],
+    /// Which peers each held object was offered to, so only those peers'
+    /// acknowledgements can release it.
+    offered: BTreeMap<ObjectId, BTreeSet<DeviceId>>,
 }
 
 impl Node {
@@ -215,6 +231,7 @@ impl Node {
             inbox: Vec::new(),
             events: Vec::new(),
             salt,
+            offered: BTreeMap::new(),
         }
     }
 
@@ -240,6 +257,11 @@ impl Node {
     /// Decrypted objects addressed to this device, in arrival order.
     pub fn inbox(&self) -> &[Delivered] {
         &self.inbox
+    }
+
+    /// Removes and returns every delivered object, freeing inbox capacity.
+    pub fn take_inbox(&mut self) -> Vec<Delivered> {
+        std::mem::take(&mut self.inbox)
     }
 
     /// Lifecycle events, in order.
@@ -300,6 +322,15 @@ impl Node {
         now: Timestamp,
         rng: &mut impl CryptoRng,
     ) -> Result<ObjectId, SubmitError> {
+        let auth = &recipient.authorization;
+        if auth.verify().is_err()
+            || auth.body.user != recipient.user
+            || auth.body.device != recipient.device
+            || auth.body.encryption_key != recipient.encryption_key
+        {
+            return Err(SubmitError::InvalidRecipient);
+        }
+        self.expire(now);
         let audience = Audience {
             user: recipient.user,
             device: recipient.device,
@@ -328,6 +359,7 @@ impl Node {
     /// Drops expired objects, emitting an event for each.
     pub fn expire(&mut self, now: Timestamp) {
         for id in self.store.expire(now) {
+            self.offered.remove(&id);
             self.emit(now, id, ObjectState::Expired, None);
         }
     }
@@ -335,24 +367,32 @@ impl Node {
     /// A peer came into contact: decide what to hand it.
     ///
     /// Objects addressed to the peer are always offered. Custody is offered
-    /// only for objects this node created (one custody hop, ADR-0006) and
-    /// only when another hop remains within the limit.
+    /// only for objects this node created (one custody hop, ADR-0006), only
+    /// when another hop remains within the limit, and only to a peer whose
+    /// user is in the contact book: advertising `accepts_custody` is a
+    /// capability, never an authorization.
     pub fn on_connect(&mut self, peer: &PeerInfo, now: Timestamp) -> Vec<Frame> {
         self.expire(now);
+        let trusted_carrier = peer.accepts_custody && self.contacts.is_trusted(&peer.user);
         let mut frames = Vec::new();
+        let mut offered = Vec::new();
         for object in self.store.iter() {
             let body = &object.envelope.body;
             let next_hop = object.hop_count + 1;
             let limit = self.effective_max_hops(body);
             let for_peer = body.audience.device == peer.device;
-            let custody_ok = object.hop_count == 0 && peer.accepts_custody && next_hop < limit;
+            let custody_ok = object.hop_count == 0 && trusted_carrier && next_hop < limit;
             if (for_peer && next_hop <= limit) || custody_ok {
+                offered.push(object.object_id);
                 frames.push(Frame::Object {
                     envelope: object.envelope.clone(),
                     ciphertext: object.ciphertext.clone(),
                     hop_count: next_hop,
                 });
             }
+        }
+        for id in offered {
+            self.offered.entry(id).or_default().insert(peer.device);
         }
         frames
     }
@@ -401,23 +441,41 @@ impl Node {
         outcome: AckOutcome,
         now: Timestamp,
     ) {
-        if self.store.get(&object_id).is_none() {
+        // Only a peer this object was actually offered to may release it.
+        let Some(object) = self.store.get(&object_id) else {
+            return;
+        };
+        if !self
+            .offered
+            .get(&object_id)
+            .is_some_and(|peers| peers.contains(&from.device))
+        {
             return;
         }
+        let from_audience = object.envelope.body.audience.device == from.device;
+        let created_here = object.hop_count == 0;
         let tag = Some(self.tag(&from.device));
         match outcome {
-            AckOutcome::Delivered | AckOutcome::Duplicate => {
-                self.store.remove(&object_id);
+            // Delivery can only be claimed by the audience device itself.
+            AckOutcome::Delivered | AckOutcome::Duplicate if from_audience => {
+                self.release(&object_id);
                 self.emit(now, object_id, ObjectState::Delivered, tag);
             }
-            AckOutcome::CustodyAccepted => {
-                self.store.remove(&object_id);
+            // Custody hand-off only exists for objects this node created.
+            AckOutcome::CustodyAccepted if created_here && !from_audience => {
+                self.release(&object_id);
                 self.emit(now, object_id, ObjectState::Forwarded, tag);
             }
+            AckOutcome::Delivered | AckOutcome::Duplicate | AckOutcome::CustodyAccepted => {}
             AckOutcome::Rejected(reason) => {
                 self.emit(now, object_id, ObjectState::Rejected(reason), tag);
             }
         }
+    }
+
+    fn release(&mut self, object_id: &ObjectId) {
+        self.store.remove(object_id);
+        self.offered.remove(object_id);
     }
 
     /// The fixed-order validation pipeline. `Err(None)` means duplicate.
@@ -429,6 +487,13 @@ impl Node {
         hop_count: u8,
         now: Timestamp,
     ) -> Result<Accepted, Option<RejectReason>> {
+        // An exact envelope we already hold or delivered is dropped before any
+        // signature, hash or decryption work: the id commits to the signed
+        // envelope, so a replay cannot buy CPU or battery.
+        let object_id = envelope.object_id();
+        if self.store.seen(&object_id) {
+            return Err(None);
+        }
         let body = &envelope.body;
         if body.version != PROTOCOL_VERSION {
             return Err(Some(RejectReason::UnsupportedVersion));
@@ -473,17 +538,20 @@ impl Node {
             if hop_count >= limit {
                 return Err(Some(RejectReason::HopLimitExceeded));
             }
+            // One custody hop: only the signed creator may hand custody over.
+            if from.device != body.creator.body.device || hop_count != 1 {
+                return Err(Some(RejectReason::CustodyNotFromCreator));
+            }
         }
         if ciphertext.len() != body.payload_size as usize
             || sha256(&[&ciphertext]) != body.payload_hash
         {
             return Err(Some(RejectReason::PayloadHashMismatch));
         }
-        let object_id = envelope.object_id();
-        if self.store.seen(&object_id) {
-            return Err(None);
-        }
         if addressed_to_me {
+            if self.inbox.len() >= self.policy.max_inbox {
+                return Err(Some(RejectReason::QuotaExceeded));
+            }
             let plaintext = crypto::open_payload(&self.device, &envelope, &ciphertext)
                 .map_err(|_| Some(RejectReason::DecryptionFailed))?;
             self.store.mark_seen(object_id);
