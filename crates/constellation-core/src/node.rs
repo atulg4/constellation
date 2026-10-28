@@ -8,6 +8,8 @@
 //! ciphertext hash → duplicate → decrypt or store.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io;
+use std::path::Path;
 
 use minicbor::{Decode, Encode};
 use rand_core::CryptoRng;
@@ -18,7 +20,7 @@ use crate::envelope::{
 };
 use crate::identity::{ContactBook, DeviceId, DeviceIdentity, DeviceRecord, EncryptionKey, UserId};
 pub use crate::store::StorePolicy;
-use crate::store::{MemoryStore, StoreError, StoredObject};
+use crate::store::{FileStore, MemoryStore, ObjectStore, PeerKey, StoreError, StoredObject};
 use crate::{domain, Timestamp, MAX_CIPHERTEXT_BYTES, MAX_PLAINTEXT_BYTES, PROTOCOL_VERSION};
 
 /// Local policy for one node.
@@ -112,6 +114,9 @@ pub enum RejectReason {
     /// Custody offered by someone other than the creator: one custody hop only.
     #[n(15)]
     CustodyNotFromCreator,
+    /// The node's store could not persist the object.
+    #[n(16)]
+    StoreUnavailable,
 }
 
 /// Lifecycle states reported in events.
@@ -209,7 +214,7 @@ pub struct Node {
     device: DeviceIdentity,
     contacts: ContactBook,
     policy: Policy,
-    store: MemoryStore,
+    store: Box<dyn ObjectStore>,
     inbox: Vec<Delivered>,
     events: Vec<Event>,
     salt: [u8; 32],
@@ -219,15 +224,40 @@ pub struct Node {
 }
 
 impl Node {
-    /// Creates a node for `device` trusting `contacts` under `policy`.
+    /// Creates a node for `device` trusting `contacts` under `policy`,
+    /// with custody held in memory for the life of the process.
     pub fn new(device: DeviceIdentity, contacts: ContactBook, policy: Policy) -> Self {
-        let salt = device.local_salt();
         let store = MemoryStore::new(policy.store.clone());
+        Self::with_store(device, contacts, policy, store)
+    }
+
+    /// Like [`Node::new`], but custody and duplicate memory persist under
+    /// `dir`, so the node resumes carrying after a restart. Opening the same
+    /// directory with the same device identity restores what was held.
+    pub fn persistent(
+        device: DeviceIdentity,
+        contacts: ContactBook,
+        policy: Policy,
+        dir: impl AsRef<Path>,
+    ) -> io::Result<Self> {
+        let store = FileStore::open(dir, policy.store.clone())?;
+        Ok(Self::with_store(device, contacts, policy, store))
+    }
+
+    /// Creates a node over an already-built store. The store's own quotas
+    /// apply; `policy.store` is not consulted again.
+    pub fn with_store(
+        device: DeviceIdentity,
+        contacts: ContactBook,
+        policy: Policy,
+        store: impl ObjectStore + 'static,
+    ) -> Self {
+        let salt = device.local_salt();
         Self {
             device,
             contacts,
             policy,
-            store,
+            store: Box::new(store),
             inbox: Vec::new(),
             events: Vec::new(),
             salt,
@@ -378,7 +408,7 @@ impl Node {
         let mut offered = Vec::new();
         for object in self.store.iter() {
             let body = &object.envelope.body;
-            let next_hop = object.hop_count + 1;
+            let next_hop = object.hop_count.saturating_add(1);
             let limit = self.effective_max_hops(body);
             let for_peer = body.audience.device == peer.device;
             let custody_ok = object.hop_count == 0 && trusted_carrier && next_hop < limit;
@@ -571,13 +601,14 @@ impl Node {
                 envelope,
                 ciphertext,
                 hop_count,
-                from: Some(from.device),
+                from: Some(self.peer_key(&from.device)),
                 received_at: now,
             })
             .map_err(|e| {
                 Some(match e {
                     StoreError::TooLarge => RejectReason::PayloadTooLarge,
                     StoreError::QuotaExceeded => RejectReason::QuotaExceeded,
+                    StoreError::Io => RejectReason::StoreUnavailable,
                 })
             })?;
         Ok(Accepted::Custody)
@@ -585,6 +616,11 @@ impl Node {
 
     fn effective_max_hops(&self, body: &EnvelopeBody) -> u8 {
         body.routing.max_hops.min(self.policy.max_hops)
+    }
+
+    /// Full-width node-local pseudonym used for per-peer custody quotas.
+    fn peer_key(&self, peer: &DeviceId) -> PeerKey {
+        PeerKey(sha256(&[domain::PEER_QUOTA_KEY, &self.salt, &peer.0]).0)
     }
 
     fn tag(&self, peer: &DeviceId) -> PeerTag {

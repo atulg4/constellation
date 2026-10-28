@@ -67,6 +67,28 @@ revisited before any wire compatibility exists.
    priority eviction. Duplicate suppression remembers every accepted,
    delivered or created id for the life of the process.
 
+## Persistence
+
+Mission 001 PR 2 adds a `FileStore` behind an `ObjectStore` trait so a
+carrier survives a process restart between accepting custody and meeting the
+recipient. The store is a directory: `objects/<object id hex>.cbor` holds one
+canonical CBOR record per accepted object (envelope, ciphertext, hop count,
+handing-over device, receipt time) and `seen.bin` holds the concatenated
+32-byte seen ids. Writes are atomic (temp file, sync, rename) and happen only
+after the full validation pipeline accepted the object, so disk never holds
+anything the in-memory store would not. At open every record is bounded by
+`MAX_FRAME_BYTES`, re-checked against its file name and the envelope's
+payload commitment, and re-admitted under the current quotas; corrupt or
+inconsistent entries are skipped and counted, never trusted. The seen set is
+capped at `MAX_SEEN_IDS` on disk. A write failure during insert is reported
+as `StoreError::Io` and acked as `RejectReason::StoreUnavailable` (wire index
+15), carrying no path or OS detail. Failures while recording a removal or a
+seen id are tolerated: the worst case is an object re-offered or re-examined
+after restart, which the pipeline already handles. Inbox contents and events
+remain process-local. Nothing on disk is plaintext or key material; the
+handing-over device id is stored because the per-peer quota needs it, exactly
+as in memory.
+
 ## Rationale
 
 HPKE is a standardized construction with test vectors, which answers the
@@ -83,7 +105,7 @@ whose behaviour can be fully specified before routing exists.
 The `hpke` crate is less widely audited than the dalek and RustCrypto
 primitives it composes. Every envelope carries 170 bytes of authorization
 overhead. Reject-on-full means a full carrier helps nobody until TTLs expire.
-Unbounded duplicate memory is a leak over long uptimes. Only one audience
+Unbounded in-memory duplicate memory is a leak over long uptimes, and the on-disk seen set drops ids past its cap. Only one audience
 device per object; multi-device users need Mission 002.
 
 ## Security Implications

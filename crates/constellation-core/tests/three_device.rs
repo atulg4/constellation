@@ -479,6 +479,127 @@ fn object_id_is_stable_across_nodes_and_derived_from_ciphertext() {
     assert_ne!(again, id);
 }
 
+#[test]
+fn carrier_survives_restart() {
+    let dir = TempDir::new("carrier-restart");
+    let a = party(1);
+    let b = party(2);
+    let c = party(3);
+    let x = party(4);
+    let book = contacts(&[&a, &b, &c, &x]);
+    let mut sim = Simulator::new(T0, 42);
+    sim.add_node(Node::new(a.device.clone(), book.clone(), endpoint_policy()));
+    sim.add_node(
+        Node::persistent(b.device.clone(), book.clone(), carrier_policy(), dir.path())
+            .expect("open store"),
+    );
+    sim.add_node(Node::new(c.device.clone(), book.clone(), endpoint_policy()));
+    sim.add_node(Node::new(x.device.clone(), book.clone(), endpoint_policy()));
+    let id = sim
+        .submit(&a.record.device, &c.record, SECRET, ONE_HOUR)
+        .expect("submit");
+
+    // A -> B custody, then A disappears.
+    sim.connect(&a.record.device, &b.record.device);
+    sim.run_until_idle();
+    assert_eq!(states(&sim, &b), vec![ObjectState::CustodyAccepted]);
+    let stored = sim.node(&b.record.device).custody()[0].clone();
+    sim.remove(&a.record.device);
+
+    // B powers off: its Node is dropped and only the directory remains.
+    sim.remove(&b.record.device);
+    sim.advance(10 * 60_000);
+
+    // B restarts from the same directory with the same device identity.
+    let rebuilt = Node::persistent(b.device.clone(), book, carrier_policy(), dir.path())
+        .expect("reopen store");
+    assert_eq!(rebuilt.custody().len(), 1);
+    assert_eq!(*rebuilt.custody()[0], stored);
+    assert!(rebuilt.events().is_empty(), "events are process-local");
+    sim.add_node(rebuilt);
+
+    // A re-sent copy, before B has met C, is recognised from the persisted seen set.
+    sim.connect(&x.record.device, &b.record.device);
+    sim.inject(
+        &x.record.device,
+        &b.record.device,
+        Frame::Object {
+            envelope: stored.envelope.clone(),
+            ciphertext: stored.ciphertext.clone(),
+            hop_count: 1,
+        },
+    );
+    sim.run_until_idle();
+    assert_eq!(states(&sim, &b), vec![ObjectState::Duplicate]);
+    assert_eq!(sim.node(&b.record.device).custody().len(), 1);
+
+    // B -> C delivery.
+    sim.connect(&b.record.device, &c.record.device);
+    sim.run_until_idle();
+    let inbox = sim.node(&c.record.device).inbox();
+    assert_eq!(inbox.len(), 1);
+    assert_eq!(inbox[0].object_id, id);
+    assert_eq!(inbox[0].plaintext, SECRET);
+    assert_eq!(
+        states(&sim, &b),
+        vec![ObjectState::Duplicate, ObjectState::Delivered]
+    );
+    assert!(sim.node(&b.record.device).custody().is_empty());
+    let on_disk = std::fs::read_dir(dir.path().join("objects"))
+        .expect("objects dir")
+        .count();
+    assert_eq!(on_disk, 0, "delivered objects leave no bytes behind");
+
+    // One more restart: nothing held, the id is still remembered.
+    sim.remove(&b.record.device);
+    let again = Node::persistent(
+        b.device.clone(),
+        contacts(&[&a, &b, &c]),
+        carrier_policy(),
+        dir.path(),
+    )
+    .expect("reopen store");
+    assert!(again.custody().is_empty());
+    sim.add_node(again);
+    sim.connect(&x.record.device, &b.record.device);
+    sim.inject(
+        &x.record.device,
+        &b.record.device,
+        Frame::Object {
+            envelope: stored.envelope,
+            ciphertext: stored.ciphertext,
+            hop_count: 1,
+        },
+    );
+    sim.run_until_idle();
+    assert_eq!(states(&sim, &b), vec![ObjectState::Duplicate]);
+}
+
+struct TempDir(std::path::PathBuf);
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        Self(std::env::temp_dir().join(format!(
+            "constellation-{tag}-{}-{nanos}",
+            std::process::id()
+        )))
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
@@ -705,4 +826,61 @@ fn known_object_is_suppressed_before_any_verification() {
         vec![ObjectState::Delivered, ObjectState::Duplicate]
     );
     assert_eq!(sim.node(&c.record.device).inbox().len(), 1);
+}
+
+#[test]
+fn carrier_store_never_holds_raw_peer_ids() {
+    let dir = TempDir::new("no-raw-peer-ids");
+    let (mut sim, a, b, c) = cast();
+    let book = contacts(&[&a, &b, &c]);
+    sim.remove(&b.record.device);
+    sim.add_node(
+        Node::persistent(b.device.clone(), book, carrier_policy(), dir.path()).expect("open store"),
+    );
+    sim.submit(&a.record.device, &c.record, SECRET, ONE_HOUR)
+        .expect("submit");
+    sim.connect(&a.record.device, &b.record.device);
+    sim.run_until_idle();
+    assert_eq!(sim.node(&b.record.device).custody().len(), 1);
+    // The handing-over device (A) is also the creator, and its id legitimately
+    // appears inside the signed envelope. What must not appear is a separate
+    // raw copy recorded as "who handed this over": count occurrences.
+    let envelope_copies = {
+        let stored = sim.node(&b.record.device).custody()[0].clone();
+        count(
+            &stored.envelope.canonical_bytes(),
+            a.record.device.as_bytes(),
+        )
+    };
+    let mut on_disk = 0;
+    for entry in walk(dir.path()) {
+        on_disk += count(
+            &std::fs::read(entry).expect("read"),
+            a.record.device.as_bytes(),
+        );
+    }
+    assert_eq!(
+        on_disk, envelope_copies,
+        "raw handing-over peer id persisted"
+    );
+}
+
+fn count(haystack: &[u8], needle: &[u8]) -> usize {
+    haystack
+        .windows(needle.len())
+        .filter(|w| *w == needle)
+        .count()
+}
+
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).expect("read_dir") {
+        let path = entry.expect("entry").path();
+        if path.is_dir() {
+            out.extend(walk(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out
 }

@@ -14,7 +14,7 @@
 //! - [`identity`]: user and device keys, signed device authorization, contact trust.
 //! - [`envelope`]: canonical signed envelope, object ids, wire frames.
 //! - [`crypto`]: HPKE payload sealing and SHA-256 helpers (no custom primitives).
-//! - [`store`]: bounded in-memory custody store with quotas and TTL expiry.
+//! - [`store`]: bounded custody stores (in-memory and on-disk) with quotas and TTL expiry.
 //! - [`node`]: the validation pipeline, custody policy, and privacy-safe events.
 //! - [`transport`]: the adapter contract that platform transports will implement.
 //! - [`sim`]: deterministic in-process network for the A/B/C scenarios.
@@ -30,6 +30,9 @@ macro_rules! fixed_bytes {
         pub struct $name(pub [u8; $len]);
 
         impl $name {
+            /// Length in bytes.
+            pub const LEN: usize = $len;
+
             /// Borrows the raw bytes.
             pub fn as_bytes(&self) -> &[u8; $len] {
                 &self.0
@@ -131,4 +134,6 @@ pub mod domain {
     pub const PAYLOAD_AAD: &[u8] = b"constellation-v1/payload-aad";
     /// Prefix for node-local peer pseudonyms in events.
     pub const PEER_TAG: &[u8] = b"constellation-v1/peer-tag";
+    /// Prefix for node-local peer pseudonyms used as custody quota keys.
+    pub const PEER_QUOTA_KEY: &[u8] = b"constellation-v1/peer-quota-key";
 }
