@@ -20,7 +20,7 @@ use crate::envelope::{
 };
 use crate::identity::{ContactBook, DeviceId, DeviceIdentity, DeviceRecord, EncryptionKey, UserId};
 pub use crate::store::StorePolicy;
-use crate::store::{FileStore, MemoryStore, ObjectStore, StoreError, StoredObject};
+use crate::store::{FileStore, MemoryStore, ObjectStore, PeerKey, StoreError, StoredObject};
 use crate::{domain, Timestamp, MAX_CIPHERTEXT_BYTES, MAX_PLAINTEXT_BYTES, PROTOCOL_VERSION};
 
 /// Local policy for one node.
@@ -408,7 +408,7 @@ impl Node {
         let mut offered = Vec::new();
         for object in self.store.iter() {
             let body = &object.envelope.body;
-            let next_hop = object.hop_count + 1;
+            let next_hop = object.hop_count.saturating_add(1);
             let limit = self.effective_max_hops(body);
             let for_peer = body.audience.device == peer.device;
             let custody_ok = object.hop_count == 0 && trusted_carrier && next_hop < limit;
@@ -601,7 +601,7 @@ impl Node {
                 envelope,
                 ciphertext,
                 hop_count,
-                from: Some(from.device),
+                from: Some(self.peer_key(&from.device)),
                 received_at: now,
             })
             .map_err(|e| {
@@ -616,6 +616,11 @@ impl Node {
 
     fn effective_max_hops(&self, body: &EnvelopeBody) -> u8 {
         body.routing.max_hops.min(self.policy.max_hops)
+    }
+
+    /// Full-width node-local pseudonym used for per-peer custody quotas.
+    fn peer_key(&self, peer: &DeviceId) -> PeerKey {
+        PeerKey(sha256(&[domain::PEER_QUOTA_KEY, &self.salt, &peer.0]).0)
     }
 
     fn tag(&self, peer: &DeviceId) -> PeerTag {

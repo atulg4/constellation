@@ -134,4 +134,6 @@ pub mod domain {
     pub const PAYLOAD_AAD: &[u8] = b"constellation-v1/payload-aad";
     /// Prefix for node-local peer pseudonyms in events.
     pub const PEER_TAG: &[u8] = b"constellation-v1/peer-tag";
+    /// Prefix for node-local peer pseudonyms used as custody quota keys.
+    pub const PEER_QUOTA_KEY: &[u8] = b"constellation-v1/peer-quota-key";
 }

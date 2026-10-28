@@ -19,7 +19,6 @@ use minicbor::{Decode, Encode};
 
 use crate::crypto::sha256;
 use crate::envelope::{Envelope, ObjectId};
-use crate::identity::DeviceId;
 use crate::{Timestamp, MAX_CIPHERTEXT_BYTES, MAX_FRAME_BYTES};
 
 /// Most seen ids a [`FileStore`] reads back at open. Ids beyond this bound
@@ -66,6 +65,14 @@ pub enum StoreError {
     Io,
 }
 
+fixed_bytes!(
+    /// Node-local pseudonym of the peer that handed an object over: a keyed
+    /// hash of its device id under a secret only this node holds. Used for
+    /// per-peer quotas; a store never holds the raw peer id.
+    PeerKey,
+    32
+);
+
 /// An object under custody, with its transport-local state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredObject {
@@ -78,7 +85,7 @@ pub struct StoredObject {
     /// Transfers so far; 0 for the creator's own copy.
     pub hop_count: u8,
     /// Who handed it over, if not created locally.
-    pub from: Option<DeviceId>,
+    pub from: Option<PeerKey>,
     /// When it entered this store.
     pub received_at: Timestamp,
 }
@@ -212,10 +219,14 @@ struct Record {
     #[n(2)]
     hop_count: u8,
     #[n(3)]
-    from: Option<DeviceId>,
+    from: Option<PeerKey>,
     #[n(4)]
     received_at: Timestamp,
 }
+
+/// Largest on-disk record: an accepted frame plus the transport-local fields
+/// a record adds (handing-over peer key, receipt time, CBOR heads).
+pub const MAX_RECORD_BYTES: usize = MAX_FRAME_BYTES + 128;
 
 const OBJECTS_DIR: &str = "objects";
 const SEEN_FILE: &str = "seen.bin";
@@ -361,6 +372,7 @@ impl ObjectStore for FileStore {
 
     fn insert(&mut self, object: StoredObject) -> Result<(), StoreError> {
         let id = object.object_id;
+        let was_seen = self.memory.seen(&id);
         self.memory.insert(object)?;
         let written = self
             .write_object(self.memory.get(&id).expect("just inserted"))
@@ -368,6 +380,10 @@ impl ObjectStore for FileStore {
         if written.is_err() {
             let _ = fs::remove_file(self.object_path(&id));
             self.memory.remove(&id);
+            // A refused object must not later read as a duplicate.
+            if !was_seen {
+                self.memory.seen.remove(&id);
+            }
             return Err(StoreError::Io);
         }
         Ok(())
@@ -403,7 +419,7 @@ impl ObjectStore for FileStore {
 /// Reads and re-validates one object file. `None` means skip it.
 fn read_record(path: &Path) -> Option<StoredObject> {
     let len = fs::metadata(path).ok()?.len();
-    if len > MAX_FRAME_BYTES as u64 {
+    if len > MAX_RECORD_BYTES as u64 {
         return None;
     }
     let bytes = fs::read(path).ok()?;
@@ -413,6 +429,16 @@ fn read_record(path: &Path) -> Option<StoredObject> {
         || record.ciphertext.len() != body.payload_size as usize
         || sha256(&[&record.ciphertext]) != body.payload_hash
     {
+        return None;
+    }
+    // Transport-local state must be one the node could have written: its own
+    // submission is hop 0 with no handing-over peer; a received object is
+    // hop 1..=max_hops with one.
+    let hops_ok = match record.from {
+        None => record.hop_count == 0,
+        Some(_) => (1..=body.routing.max_hops).contains(&record.hop_count),
+    };
+    if !hops_ok {
         return None;
     }
     let object_id = record.envelope.object_id();
@@ -462,7 +488,7 @@ mod tests {
     use rand_chacha::rand_core::SeedableRng;
     use rand_chacha::ChaCha20Rng;
 
-    fn object(tag: u8, size: usize, from: Option<DeviceId>, expires_at: Timestamp) -> StoredObject {
+    fn object(tag: u8, size: usize, from: Option<PeerKey>, expires_at: Timestamp) -> StoredObject {
         let mut rng = ChaCha20Rng::from_seed([tag; 32]);
         let user = UserIdentity::generate(&mut rng);
         let device = DeviceIdentity::generate(&user, 0, &mut rng);
@@ -492,7 +518,8 @@ mod tests {
             object_id: envelope.object_id(),
             envelope,
             ciphertext: vec![tag; size],
-            hop_count: 1,
+            // As a node writes it: own submissions are hop 0, received ones hop 1.
+            hop_count: u8::from(from.is_some()),
             from,
             received_at: 0,
         }
@@ -506,7 +533,7 @@ mod tests {
             max_objects: 10,
             max_objects_per_peer: 1,
         });
-        let peer = DeviceId([9; 32]);
+        let peer = PeerKey([9; 32]);
         assert_eq!(
             store.insert(object(1, 101, None, 10)),
             Err(StoreError::TooLarge)
@@ -574,7 +601,7 @@ mod tests {
     #[test]
     fn file_store_round_trips_objects_and_seen_across_reopen() {
         let dir = TempDir::new("roundtrip");
-        let peer = DeviceId([9; 32]);
+        let peer = PeerKey([9; 32]);
         let held = object(1, 40, Some(peer), 1_000);
         let delivered = object(2, 5, None, 1_000).object_id;
         let gone = object(3, 5, None, 1_000);
@@ -626,7 +653,7 @@ mod tests {
         std::fs::write(&path, &bytes).expect("tamper");
         // Not CBOR at all, and larger than any frame could be.
         std::fs::write(objects.join("junk.cbor"), b"not an object").expect("junk");
-        std::fs::write(objects.join("huge.cbor"), vec![0u8; MAX_FRAME_BYTES + 1]).expect("huge");
+        std::fs::write(objects.join("huge.cbor"), vec![0u8; MAX_RECORD_BYTES + 1]).expect("huge");
         // A torn seen-set write leaves a partial trailing id.
         let seen = dir.path().join("seen.bin");
         let mut bytes = std::fs::read(&seen).expect("read seen");
@@ -641,5 +668,138 @@ mod tests {
         assert!(store.seen(&good.object_id));
         assert!(store.seen(&truncated.object_id));
         assert!(store.seen(&tampered.object_id));
+    }
+
+    #[test]
+    fn failed_write_rolls_back_duplicate_memory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("rollback");
+        let held = object(1, 40, Some(PeerKey([9; 32])), 1_000);
+        let mut store = FileStore::open(dir.path(), StorePolicy::default()).expect("open");
+        let objects = dir.path().join("objects");
+        std::fs::set_permissions(&objects, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+        assert_eq!(store.insert(held.clone()), Err(StoreError::Io));
+        std::fs::set_permissions(&objects, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        assert!(
+            !store.seen(&held.object_id),
+            "a refused object must not read as a duplicate"
+        );
+        assert_eq!(store.insert(held.clone()), Ok(()));
+        assert!(store.seen(&held.object_id));
+    }
+
+    #[test]
+    fn records_with_impossible_hop_state_are_skipped_at_load() {
+        let dir = TempDir::new("hops");
+        let relayed = object(1, 40, Some(PeerKey([9; 32])), 1_000);
+        let own = object(2, 40, None, 1_000);
+        {
+            let mut store = FileStore::open(dir.path(), StorePolicy::default()).expect("open");
+            store.insert(relayed.clone()).expect("insert");
+            store.insert(own.clone()).expect("insert");
+        }
+        let rewrite = |o: &StoredObject, hop_count: u8| {
+            let record = Record {
+                envelope: o.envelope.clone(),
+                ciphertext: o.ciphertext.clone(),
+                hop_count,
+                from: o.from,
+                received_at: o.received_at,
+            };
+            std::fs::write(
+                object_path(dir.path(), &o.object_id),
+                minicbor::to_vec(&record).expect("encode"),
+            )
+            .expect("write");
+        };
+        rewrite(&relayed, 255); // beyond the envelope's max_hops
+        rewrite(&own, 1); // a local submission (no handing-over peer) is hop 0
+        let store = FileStore::open(dir.path(), StorePolicy::default()).expect("reopen");
+        assert_eq!(store.len(), 0);
+        assert_eq!(store.rejected_at_load(), 2);
+    }
+
+    #[test]
+    fn largest_acceptable_frame_survives_reopen() {
+        use crate::envelope::Frame;
+        let dir = TempDir::new("max-size");
+        let mut rng = ChaCha20Rng::from_seed([5; 32]);
+        let user = UserIdentity::generate(&mut rng);
+        let device = DeviceIdentity::generate(&user, 0, &mut rng);
+        let ciphertext = vec![7u8; MAX_CIPHERTEXT_BYTES];
+        let build = |type_len: usize| {
+            let body = EnvelopeBody {
+                version: 1,
+                object_type: "t".repeat(type_len),
+                creator: device.record().authorization,
+                created_at: u64::MAX / 4,
+                expires_at: u64::MAX / 2,
+                audience: Audience {
+                    user: device.user(),
+                    device: device.id(),
+                },
+                payload_size: ciphertext.len() as u32,
+                payload_hash: sha256(&[&ciphertext]),
+                encryption: Encryption {
+                    suite: SUITE_HPKE_X25519_HKDF_SHA256_CHACHA20POLY1305,
+                    encapsulated_key: EncryptionKey([0; 32]),
+                },
+                routing: Routing {
+                    max_hops: 2,
+                    priority: 0,
+                },
+            };
+            Envelope::sign(body, &device)
+        };
+        // Grow object_type to the largest wire frame that still fits
+        // MAX_FRAME_BYTES (CBOR length heads can make exact equality unreachable).
+        let frame_len = |envelope: &Envelope| {
+            Frame::Object {
+                envelope: envelope.clone(),
+                ciphertext: ciphertext.clone(),
+                hop_count: 1,
+            }
+            .encode()
+            .len()
+        };
+        let mut type_len = 1;
+        while frame_len(&build(type_len + 1)) <= MAX_FRAME_BYTES {
+            type_len += (MAX_FRAME_BYTES - frame_len(&build(type_len))).max(1);
+            while frame_len(&build(type_len)) > MAX_FRAME_BYTES {
+                type_len -= 1;
+            }
+        }
+        let envelope = build(type_len);
+        let wire = Frame::Object {
+            envelope: envelope.clone(),
+            ciphertext: ciphertext.clone(),
+            hop_count: 1,
+        }
+        .encode();
+        assert!(
+            wire.len() + 2 >= MAX_FRAME_BYTES,
+            "frame too small: {}",
+            wire.len()
+        );
+        assert!(
+            Frame::decode(&wire).is_ok(),
+            "the frame is acceptable on the wire"
+        );
+        let held = StoredObject {
+            object_id: envelope.object_id(),
+            envelope,
+            ciphertext,
+            hop_count: 1,
+            from: Some(PeerKey([9; 32])),
+            received_at: u64::MAX / 2,
+        };
+        let policy = StorePolicy::default();
+        {
+            let mut store = FileStore::open(dir.path(), policy.clone()).expect("open");
+            store.insert(held.clone()).expect("insert");
+        }
+        let store = FileStore::open(dir.path(), policy).expect("reopen");
+        assert_eq!(store.rejected_at_load(), 0);
+        assert_eq!(store.get(&held.object_id), Some(&held));
     }
 }

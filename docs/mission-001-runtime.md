@@ -86,12 +86,19 @@ dir/
 
 Each object file is the canonical CBOR of a record holding the signed
 envelope, the ciphertext, and the transport-local fields (`hop_count`,
-`from`, `received_at`). Nothing is written until the validation pipeline has
-accepted the object, and nothing written is ever plaintext or key material.
+`from`, `received_at`). `from` is a `PeerKey`, a keyed hash of the handing-over
+device id under a secret only this node holds, never the raw peer id. Nothing
+is written until the validation pipeline has accepted the object, and nothing
+written is ever plaintext or key material. A write that fails leaves no
+duplicate-memory entry behind, so a retransmission is accepted once storage
+recovers.
 Writes go to a `.tmp` sibling, are synced, and are renamed into place, so a
 crash leaves the old file or the new one. At open, every entry is bounded by
-`MAX_FRAME_BYTES`, decoded, checked against its file name and the envelope's
-payload size and hash, and inserted under the current quotas; entries that
+`MAX_RECORD_BYTES` (an accepted frame plus record metadata), decoded, checked
+against its file name and the envelope's payload size and hash, required to
+have hop state a node could have written (own submission: hop 0, no peer;
+received: hop 1 to `max_hops`, with a peer), and inserted under the current
+quotas; entries that
 fail are skipped and counted in `FileStore::rejected_at_load`. The seen set is
 read back up to `MAX_SEEN_IDS` entries. Inbox contents and lifecycle events
 are process-local and are not persisted.

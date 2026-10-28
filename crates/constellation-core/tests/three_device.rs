@@ -827,3 +827,60 @@ fn known_object_is_suppressed_before_any_verification() {
     );
     assert_eq!(sim.node(&c.record.device).inbox().len(), 1);
 }
+
+#[test]
+fn carrier_store_never_holds_raw_peer_ids() {
+    let dir = TempDir::new("no-raw-peer-ids");
+    let (mut sim, a, b, c) = cast();
+    let book = contacts(&[&a, &b, &c]);
+    sim.remove(&b.record.device);
+    sim.add_node(
+        Node::persistent(b.device.clone(), book, carrier_policy(), dir.path()).expect("open store"),
+    );
+    sim.submit(&a.record.device, &c.record, SECRET, ONE_HOUR)
+        .expect("submit");
+    sim.connect(&a.record.device, &b.record.device);
+    sim.run_until_idle();
+    assert_eq!(sim.node(&b.record.device).custody().len(), 1);
+    // The handing-over device (A) is also the creator, and its id legitimately
+    // appears inside the signed envelope. What must not appear is a separate
+    // raw copy recorded as "who handed this over": count occurrences.
+    let envelope_copies = {
+        let stored = sim.node(&b.record.device).custody()[0].clone();
+        count(
+            &stored.envelope.canonical_bytes(),
+            a.record.device.as_bytes(),
+        )
+    };
+    let mut on_disk = 0;
+    for entry in walk(dir.path()) {
+        on_disk += count(
+            &std::fs::read(entry).expect("read"),
+            a.record.device.as_bytes(),
+        );
+    }
+    assert_eq!(
+        on_disk, envelope_copies,
+        "raw handing-over peer id persisted"
+    );
+}
+
+fn count(haystack: &[u8], needle: &[u8]) -> usize {
+    haystack
+        .windows(needle.len())
+        .filter(|w| *w == needle)
+        .count()
+}
+
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).expect("read_dir") {
+        let path = entry.expect("entry").path();
+        if path.is_dir() {
+            out.extend(walk(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out
+}
